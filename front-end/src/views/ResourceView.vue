@@ -33,6 +33,7 @@ const eventFilters = reactive({ user_id: '', device_id: '', event_type: '', from
 const dialogOpen = ref(false)
 const credentialOpen = ref(false)
 const credential = ref('')
+const credentialDeviceId = ref('')
 const editing = ref(null)
 const form = reactive({})
 const options = reactive({ users: [], devices: [] })
@@ -180,6 +181,7 @@ const submit = async () => {
     dialogOpen.value = false
     if (resource.value === 'devices' && !isUpdate && data.data?.device_credential) {
       credential.value = data.data.device_credential
+      credentialDeviceId.value = data.data.device?.id || ''
       credentialOpen.value = true
     }
     toast.add({ severity: 'success', summary: isUpdate ? 'Đã cập nhật' : 'Đã tạo mới', detail: data.message || 'Dữ liệu đã được lưu.', life: 3500 })
@@ -211,6 +213,7 @@ const confirmAction = ({ header, message, label, action, danger = false, trackCo
       }
       if (result?.data?.data?.device_credential) {
         credential.value = result.data.data.device_credential
+        credentialDeviceId.value = result.data.data.device?.id || ''
         credentialOpen.value = true
       }
       toast.add({ severity: 'success', summary: 'Đã hoàn tất', detail: result?.data?.message || 'Thao tác đã được ghi nhận.', life: 3500 })
@@ -295,6 +298,14 @@ const copyCredential = async () => {
     toast.add({ severity: 'success', summary: 'Đã sao chép', detail: 'Credential đã được sao chép.', life: 2000 })
   } catch {
     toast.add({ severity: 'error', summary: 'Không thể sao chép', detail: 'Trình duyệt không cho phép clipboard. Hãy chọn và sao chép thủ công.', life: 3000 })
+  }
+}
+const copyDeviceId = async () => {
+  try {
+    await navigator.clipboard.writeText(credentialDeviceId.value)
+    toast.add({ severity: 'success', summary: 'Đã sao chép', detail: 'UUID thiết bị đã được sao chép.', life: 2000 })
+  } catch {
+    toast.add({ severity: 'error', summary: 'Không thể sao chép', detail: 'Trình duyệt không cho phép clipboard. Hãy chọn và sao chép UUID thủ công.', life: 3000 })
   }
 }
 
@@ -733,18 +744,29 @@ onMounted(async () => { await loadOptions(); await load() })
     >
       <div class="credential-content">
         <div class="credential-warning">
-          <ShieldCheck :size="20" /><p>Credential chỉ xuất hiện lần này. Sao chép và lưu trong trình quản lý bí mật của firmware trước khi đóng hộp thoại.</p>
-        </div><label>Device credential</label><code>{{ credential }}</code><div class="dialog-actions">
+          <ShieldCheck :size="20" /><p>Hãy chép UUID vào DEVICE_ID và credential vào DEVICE_CREDENTIAL trong firmware. Credential chỉ xuất hiện lần này.</p>
+        </div>
+        <template v-if="credentialDeviceId">
+          <label>Device ID (UUID)</label><code>{{ credentialDeviceId }}</code>
+        </template>
+        <label>Device credential</label><code>{{ credential }}</code><div class="dialog-actions">
+          <Button
+            v-if="credentialDeviceId"
+            type="button"
+            label="Sao chép UUID"
+            class="button-secondary"
+            @click="copyDeviceId"
+          />
           <Button
             type="button"
-            label="Sao chép"
+            label="Sao chép credential"
             class="button-secondary"
             @click="copyCredential"
           /><Button
             type="button"
             label="Đã lưu an toàn"
             class="button-primary"
-            @click="credentialOpen = false; credential = ''"
+            @click="credentialOpen = false; credential = ''; credentialDeviceId = ''"
           />
         </div>
       </div>

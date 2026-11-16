@@ -89,24 +89,31 @@ cd ..\front-end; npm test; npm run lint; npm run build
 
 Các bài test kiểm tra UUID, phân trang, escaping truy vấn, đăng ký, formatter giao diện và theo dõi ACK/timeout mà không gửi lại lệnh. Tích hợp Supabase/firmware cần xác minh riêng sau khi áp dụng migration và cấu hình thiết bị.
 
-## Mẫu kết nối firmware ESP32-CAM (Arduino)
+## Firmware kết nối ESP32-CAM (Arduino)
 
-Firmware kết nối bằng HTTPS tới Express, không kết nối trực tiếp Supabase. Trong trang **Thiết bị**, tạo thiết bị rồi chép `device_credential` hiển thị một lần. Firmware chỉ lưu credential này; không nhúng `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN_SECRET` hay token web vào sketch.
+Ví dụ tối giản gồm ba hàm: giữ kết nối và xác thực thiết bị, nhận lệnh đang chờ, gửi heartbeat/trạng thái cửa. ESP32-CAM gọi API backend qua HTTPS, không kết nối trực tiếp Supabase.
 
-Trước khi chạy, thay các giá trị mẫu, cài ArduinoJson và thêm CA certificate của máy chủ vào `WiFiClientSecure`. Không dùng `setInsecure()` trên mạng thật. Đồng bộ giờ NTP trước request đầu tiên vì timestamp phải lệch máy chủ không quá 90 giây.
+Thay các giá trị mẫu trước khi nạp firmware:
 
-```cpp
+- API_BASE: URL backend kèm /api, ví dụ https://api.example.com/api.
+- DEVICE_ID: UUID của thiết bị trong hệ thống, không phải device_code.
+- DEVICE_CREDENTIAL: credential thiết bị được cấp khi tạo thiết bị; chỉ hiển thị một lần.
+- ROOT_CA: CA certificate hợp lệ của máy chủ HTTPS. Không dùng setInsecure() trên mạng thật.
+- Cài thư viện ArduinoJson. Backend yêu cầu giờ NTP chính xác (sai lệch tối đa 90 giây) cho request xác thực và heartbeat.
+
+~~~cpp
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_system.h>
 #include <time.h>
 
-const char* API_BASE = "https://your-domain.example.com/api";
-const char* WIFI_SSID = "<wifi-ssid>";
-const char* WIFI_PASSWORD = "<wifi-password>";
-const char* DEVICE_ID = "<uuid-thiet-bi>";
-const char* DEVICE_CREDENTIAL = "<credential-cap-mot-lan>";
+const char* WIFI_SSID = "Top1tg";
+const char* WIFI_PASSWORD = "87654321";
+const char* API_BASE = "https://web-control-esp32-cam.onrender.com/api";
+const char* DEVICE_ID = "9cb7ac34-adfd-4785-ae43-023e321d2dcb";
+const char* DEVICE_CREDENTIAL = "D-GRKc46apMmclTo-_1UctNT6DSY9W66w8PnPvuzD10";
 const char* ROOT_CA = R"CERT(
 -----BEGIN CERTIFICATE-----
 <CA-certificate-cua-may-chu>
@@ -116,23 +123,58 @@ const char* ROOT_CA = R"CERT(
 WiFiClientSecure tls;
 String deviceToken;
 uint32_t tokenExpiresAt = 0;
+uint32_t nextConnectionAttemptAt = 0;
+bool connectionRetryPending = false;
 
-String newNonce() {
-  char value[17];
-  snprintf(value, sizeof(value), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
-  return String(value); // 16 ký tự hex, phải tạo nonce mới cho mỗi POST
-}
+// 1. Kết nối Wi-Fi, lấy JWT và tự xác thực lại trước khi JWT hết hạn.
+bool maintainConnection() {
+  const bool tokenIsValid = deviceToken.length() > 0 &&
+      (int32_t)(tokenExpiresAt - millis()) > 30000;
+  if (WiFi.status() == WL_CONNECTED && tokenIsValid) return true;
+  if (connectionRetryPending &&
+      (int32_t)(millis() - nextConnectionAttemptAt) < 0) return false;
 
-void addFreshHeaders(HTTPClient& http) {
-  http.addHeader("X-Device-Timestamp", String((unsigned long)time(nullptr)));
-  http.addHeader("X-Device-Nonce", newNonce());
-}
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.reconnect();
+    const uint32_t startedAt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 10000) {
+      delay(250);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      connectionRetryPending = true;
+      nextConnectionAttemptAt = millis() + 10000;
+      Serial.println("[WIFI] reconnect failed; retry in 10s");
+      return false;
+    }
+  }
 
-bool authenticateDevice() {
+  if (deviceToken.length() > 0 &&
+      (int32_t)(tokenExpiresAt - millis()) > 30000) {
+    connectionRetryPending = false;
+    return true;
+  }
+
+  if (time(nullptr) < 1700000000) {
+    connectionRetryPending = true;
+    nextConnectionAttemptAt = millis() + 10000;
+    Serial.println("[NTP] clock not ready; retry in 10s");
+    return false;
+  }
+
+  connectionRetryPending = true;
+  nextConnectionAttemptAt = millis() + 10000;
   HTTPClient http;
-  if (!http.begin(tls, String(API_BASE) + "/device/auth")) return false;
+  if (!http.begin(tls, String(API_BASE) + "/device/auth")) {
+    Serial.println("[AUTH] could not start HTTPS request");
+    return false;
+  }
   http.addHeader("Content-Type", "application/json");
-  addFreshHeaders(http);
+  http.addHeader("X-Device-Timestamp", String((unsigned long)time(nullptr)));
+
+  char nonce[17];
+  snprintf(nonce, sizeof(nonce), "%08lx%08lx",
+           (unsigned long)esp_random(), (unsigned long)esp_random());
+  http.addHeader("X-Device-Nonce", nonce);
 
   StaticJsonDocument<256> request;
   request["device_id"] = DEVICE_ID;
@@ -140,89 +182,125 @@ bool authenticateDevice() {
   String body;
   serializeJson(request, body);
 
-  int code = http.POST(body);
-  String response = http.getString();
+  const int code = http.POST(body);
+  const String response = http.getString();
+  Serial.printf("[AUTH] HTTP=%d, free heap=%u\n", code, ESP.getFreeHeap());
   http.end();
-  if (code != 200) return false;
+  if (code != 200) {
+    deviceToken = "";
+    tokenExpiresAt = 0;
+    return false;
+  }
 
   StaticJsonDocument<512> result;
   if (deserializeJson(result, response)) return false;
   deviceToken = result["data"]["access_token"].as<String>();
-  tokenExpiresAt = millis() + 240000; // làm mới trước khi JWT 5 phút hết hạn
+  const uint32_t expiresIn = result["data"]["expires_in"] | 300;
+  tokenExpiresAt = millis() + expiresIn * 1000UL;
+  connectionRetryPending = false;
   return deviceToken.length() > 0;
 }
 
-bool ensureDeviceToken() {
-  return deviceToken.length() > 0 && (int32_t)(tokenExpiresAt - millis()) > 0
-      ? true : authenticateDevice();
-}
+// 2. Lấy lệnh đang chờ; trả về chuỗi "command-id|command", hoặc chuỗi rỗng.
+String receiveRequest() {
+  if (!maintainConnection()) return "";
 
-void addDeviceHeaders(HTTPClient& http) {
+  HTTPClient http;
+  if (!http.begin(tls, String(API_BASE) + "/device/commands/pending")) return "";
   http.addHeader("Authorization", "Bearer " + deviceToken);
   http.addHeader("X-Device-Id", DEVICE_ID);
+
+  const int code = http.GET();
+  const String response = http.getString();
+  Serial.printf("[POLL] HTTP=%d, bytes=%u, free heap=%u\n",
+                code, response.length(), ESP.getFreeHeap());
+  http.end();
+  if (code != 200) {
+    if (code == 401) {
+      deviceToken = "";
+      tokenExpiresAt = 0;
+    }
+    return "";
+  }
+
+  DynamicJsonDocument result(8192);
+  if (deserializeJson(result, response)) return "";
+  JsonArray commands = result["data"].as<JsonArray>();
+  if (commands.isNull() || commands.size() == 0) return "";
+
+  JsonObject command = commands[0];
+  const String id = command["id"] | "";
+  const String name = command["command"] | "";
+  if (id.length() == 0 || name.length() == 0) return "";
+  return id + "|" + name;
 }
 
-bool sendHeartbeat(const char* doorState) {
-  if (!ensureDeviceToken()) return false;
+// 3. Báo phiên bản firmware và trạng thái cửa thực tế lên backend.
+bool sendStatus(const char* doorState) {
+  if (!maintainConnection()) return false;
+
   HTTPClient http;
   if (!http.begin(tls, String(API_BASE) + "/device/heartbeat")) return false;
   http.addHeader("Content-Type", "application/json");
-  addDeviceHeaders(http);
-  addFreshHeaders(http);
+  http.addHeader("Authorization", "Bearer " + deviceToken);
+  http.addHeader("X-Device-Id", DEVICE_ID);
+  http.addHeader("X-Device-Timestamp", String((unsigned long)time(nullptr)));
+
+  char nonce[17];
+  snprintf(nonce, sizeof(nonce), "%08lx%08lx",
+           (unsigned long)esp_random(), (unsigned long)esp_random());
+  http.addHeader("X-Device-Nonce", nonce);
 
   StaticJsonDocument<192> body;
   body["firmware_version"] = "1.0.0";
-  body["door_state"] = doorState; // locked, unlocked, hoặc unknown
+  body["door_state"] = doorState; // locked, unlocked hoặc unknown
   String json;
   serializeJson(body, json);
-  int code = http.POST(json);
+
+  const int code = http.POST(json);
+  Serial.printf("[HEARTBEAT] HTTP=%d, free heap=%u\n", code, ESP.getFreeHeap());
   http.end();
-  return code == 200;
-}
-
-// Gọi GET /device/commands/pending mỗi ~2 giây, không cần timestamp/nonce.
-// Với mỗi lệnh, thực thi đúng một lần theo command.id rồi gọi hàm ACK bên dưới.
-// Lưu command.id và kết quả ACK vào Preferences/NVS để xử lý an toàn khi mất điện
-// hoặc mất response; nếu ID đã lưu, gửi lại ACK đã lưu, tuyệt đối không kích relay lại.
-
-bool sendCommandAck(const String& commandId, const char* status, const char* doorState) {
-  if (!ensureDeviceToken()) return false;
-  HTTPClient http;
-  if (!http.begin(tls, String(API_BASE) + "/device/commands/" + commandId + "/ack")) return false;
-  http.addHeader("Content-Type", "application/json");
-  addDeviceHeaders(http);
-  addFreshHeaders(http);
-
-  StaticJsonDocument<192> body;
-  body["status"] = status; // acknowledged hoặc failed
-  body["response"]["door_state"] = doorState;
-  if (String(status) == "failed") body["error_message"] = "Thao tác phần cứng thất bại";
-  String json;
-  serializeJson(body, json);
-  int code = http.POST(json);
-  http.end();
+  if (code == 401) {
+    deviceToken = "";
+    tokenExpiresAt = 0;
+  }
   return code == 200;
 }
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("[BOOT] setup started");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
 
   tls.setCACert(ROOT_CA);
   configTime(0, 0, "pool.ntp.org", "time.google.com");
-  while (time(nullptr) < 1700000000) delay(250); // chờ NTP để timestamp hợp lệ
-  if (!authenticateDevice()) Serial.println("Device authentication failed");
+
+  Serial.println("[BOOT] Wi-Fi and NTP started");
+  maintainConnection();
 }
-```
 
-Thứ tự request và JSON firmware cần gửi:
+void loop() {
+  static uint32_t lastPollAt = 0;
+  static uint32_t lastHeartbeatAt = 0;
 
-1. **Lấy JWT thiết bị:** `POST /api/device/auth` với `device_id` và `credential`; kèm `X-Device-Timestamp` (Unix giây) và `X-Device-Nonce` (nonce mới, tối thiểu 16 ký tự). JWT hết hạn sau 5 phút.
-2. **Heartbeat:** `POST /api/device/heartbeat` với `Authorization: Bearer <jwt>`, `X-Device-Id`, timestamp/nonce mới và body như `{"firmware_version":"1.0.0","door_state":"unknown"}`. Gửi heartbeat khoảng 30 giây/lần.
-3. **Nhận lệnh:** `GET /api/device/commands/pending` với `Authorization` và `X-Device-Id`. Lệnh có thể được giao lại; kiểm tra ID đã xử lý trước khi điều khiển relay. Hỗ trợ `unlock`, `lock`, `sync_permissions`, `restart`.
-4. **ACK:** sau khi xử lý lệnh, `POST /api/device/commands/<command-id>/ack` với timestamp/nonce mới và body `{"status":"acknowledged","response":{"door_state":"locked"}}`; nếu thao tác lỗi, gửi `status: "failed"` cùng `error_message`.
-5. **Gửi sự kiện nhận diện:** `POST /api/device/events` với timestamp/nonce mới, `Idempotency-Key` mới và body gồm `user_id`, `decision`, `confidence`, `occurred_at` (xem ví dụ ở [API.md](</D:/Code/Iot/Code Web Control/back-end/docs/API.md>)).
+  if (millis() - lastPollAt >= 10000) {
+    lastPollAt = millis();
+    const String request = receiveRequest();
+    if (request.length() > 0) {
+      Serial.println("Lenh nhan duoc: " + request);
+      // Gọi phần xử lý relay/cảm biến của bạn tại đây.
+    }
+  }
 
-Trạng thái `door_state` chỉ phản ánh giá trị phần cứng firmware đo được. Nếu ESP32-CAM chưa có công tắc/cảm biến cửa, gửi `unknown`; không báo `locked` chỉ dựa trên việc đã bật relay. Cần áp dụng migration `202611160001_door_state_and_lock_command.sql` trước khi backend nhận `door_state` và lệnh `lock`.
+  if (millis() - lastHeartbeatAt >= 30000) {
+    lastHeartbeatAt = millis();
+    // Chỉ gửi locked/unlocked nếu có cảm biến xác nhận; nếu không gửi unknown.
+    sendStatus("unknown");
+  }
+
+  delay(20);
+}
+~~~
+
+receiveRequest() chỉ đọc lệnh, chưa điều khiển relay và chưa gửi ACK. Backend có thể giao lại lệnh ở lần poll sau cho tới khi thiết bị gọi POST /api/device/commands/<command-id>/ack; vì vậy cần thêm xử lý chống chạy lặp và ACK sau khi thao tác phần cứng thành công trước khi dùng lệnh khóa/mở cửa thực tế. sendStatus() chỉ gửi heartbeat; trạng thái phải phản ánh cảm biến cửa, không suy ra từ việc bật relay.
