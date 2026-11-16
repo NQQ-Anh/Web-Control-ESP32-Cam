@@ -3,7 +3,7 @@ const terminalStatuses = new Set(['acknowledged', 'failed', 'expired'])
 const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
 export const waitForCommand = async (api, command, {
-  intervalMs = 1500,
+  intervalMs = 1000,
   graceMs = 8000,
   maxWaitMs = 125_000,
   sleep = pause,
